@@ -6,10 +6,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from fastcs.attributes import AttrHandlerRW, Attribute, AttrR, AttrRW, AttrW
+from fastcs.attribute_io import AttributeIO
+from fastcs.attribute_io_ref import AttributeIORef
+from fastcs.attributes import Attribute, AttrR, AttrRW, AttrW
 from fastcs.connections import IPConnection, IPConnectionSettings
 from fastcs.controller import Controller, SubController
-from fastcs.datatypes import Bool, DataType, Float, Int, String
+from fastcs.datatypes import Bool, DataType, Float, Int, String, T
 from fastcs.launch import FastCS
 from fastcs.transport.epics.ca.options import EpicsCAOptions
 from fastcs.transport.epics.options import EpicsIOCOptions
@@ -46,41 +48,41 @@ def create_attributes(parameters: dict[str, Any]) -> dict[str, Attribute]:
             print(f"Failed to validate parameter '{parameter}'\n{e}")
             continue
 
-        handler = TemperatureControllerHandler(parameter.command)
+        io_ref = TemperatureControllerAttributeIORef(command_name=parameter.command)
         match parameter.access_mode:
             case "r":
-                attributes[name] = AttrR(parameter.fastcs_datatype, handler=handler)
+                attributes[name] = AttrR(parameter.fastcs_datatype, io_ref=io_ref)
             case "rw":
-                attributes[name] = AttrRW(parameter.fastcs_datatype, handler=handler)
+                attributes[name] = AttrRW(parameter.fastcs_datatype, io_ref=io_ref)
 
     return attributes
 
 
-@dataclass
-class TemperatureControllerHandler(AttrHandlerRW):
+@dataclass(kw_only=True)
+class TemperatureControllerAttributeIORef(AttributeIORef):
     command_name: str
     update_period: float | None = 0.2
-    _controller: TemperatureController | None = None
+
+
+class TemperatureControllerAttributeIO(
+    AttributeIO[T, TemperatureControllerAttributeIORef]
+):
+    def __init__(self, connection: IPConnection):
+        self._connection = connection
 
     async def update(self, attr: AttrR):
-        response = await self.controller.connection.send_query(
-            f"{self.command_name}?\r\n"
-        )
+        response = await self._connection.send_query(f"{attr.io_ref.command_name}?\r\n")
         value = response.strip("\r\n")
 
         await attr.set(attr.dtype(value))
 
     async def put(self, attr: AttrW, value: Any):
-        await self.controller.connection.send_command(
-            f"{self.command_name}={value}\r\n"
-        )
+        await self._connection.send_command(f"{attr.io_ref.command_name}={value}\r\n")
 
 
 class TemperatureRampController(SubController):
-    def __init__(self, index: int, connection: IPConnection):
-        super().__init__(f"Ramp {index}")
-
-        self.connection = connection
+    def __init__(self, index: int, io: AttributeIO):
+        super().__init__(f"Ramp {index}", ios=[io])
 
     async def initialise(self, parameters: dict[str, Any]):
         self.attributes.update(create_attributes(parameters))
@@ -88,10 +90,10 @@ class TemperatureRampController(SubController):
 
 class TemperatureController(Controller):
     def __init__(self, settings: IPConnectionSettings):
-        super().__init__()
-
         self._ip_settings = settings
         self.connection = IPConnection()
+        self._temperature_io = TemperatureControllerAttributeIO(self.connection)
+        super().__init__(ios=[self._temperature_io])
 
     async def connect(self):
         await self.connection.connect(self._ip_settings)
@@ -105,7 +107,7 @@ class TemperatureController(Controller):
         self.attributes.update(create_attributes(api))
 
         for idx, ramp_parameters in enumerate(ramps_api):
-            ramp_controller = TemperatureRampController(idx + 1, self.connection)
+            ramp_controller = TemperatureRampController(idx + 1, self._temperature_io)
             self.register_sub_controller(f"Ramp{idx + 1:02d}", ramp_controller)
             await ramp_controller.initialise(ramp_parameters)
 
